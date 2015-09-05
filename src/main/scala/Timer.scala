@@ -12,7 +12,7 @@ class Timer (
   }
 
   val period  = if (cycle > 0) cycle else (duration * frequency * 1000) toLong
-  val counter = RegInit(init = UInt(0, width = log2Up(cycle)))
+  val counter = RegInit(UInt(0, width = log2Up(cycle)))
   val state   = RegInit(Bool(false))
 
   when (state && io.accept) {
@@ -29,31 +29,29 @@ class Timer (
   io.ready := state
 }
 
-object Timer {
+class TimerTests(c: Timer) extends Tester(c, isTrace = false) {
 
+  val timing  = "-----#-----#-----#-----#-----#-----#-----#-----#-----#"
+  val readies = "------#-----###---#########---#########---#-----#-----"
+  val accepts = "------#-------#--------#--#-----------#############---"
+
+  def c2i (c: Char) = c match {
+    case '-' => 0
+    case '#' => 1
+    case  _  => throw new RuntimeException("illegal diagram")
+  }
+
+  for ((ready, accept) <- readies zip accepts) {
+    poke(c.io.accept, c2i(accept))
+    expect(c.io.ready, c2i(ready))
+    step(1)
+  }
+}
+
+object Timer {
   def main(args: Array[String]): Unit = {
     chiselMainTest(args, () => Module(new Timer(cycle = 6))) { c =>
       new TimerTests(c)
-    }
-  }
-
-  class TimerTests(c: Timer) extends Tester(c, isTrace = false) {
-
-    val timing  = "-----#-----#-----#-----#-----#-----#-----#-----#-----#"
-    val redies  = "------#-----###---#########---#########---#-----#-----"
-    val accepts = "------#-------#--------#--#-----------#############---"
-
-    def c2i (c: Char) =
-      c match {
-        case '-' => 0
-        case '#' => 1
-        case  _  => -1
-      }
-
-    for ((ready, accept) <- redies zip accepts) {
-      poke(c.io.accept, c2i(accept))
-      expect(c.io.ready, c2i(ready))
-      step(1)
     }
   }
 }
