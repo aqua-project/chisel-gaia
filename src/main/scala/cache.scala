@@ -13,7 +13,7 @@ import Chisel._
 
  Arguments
 =================
- * wayBits : bit size of lines
+ * wayBits : bit size of way
  * lineBits : bit size of lines
 
  */
@@ -21,6 +21,7 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
   val io = new Bundle {
     val pohe = UInt (OUTPUT);
     val hyoe = UInt (OUTPUT);
+    val d_wdata_from_core = UInt (OUTPUT);
     val foo = UInt (OUTPUT);
     val bar = UInt (OUTPUT);
     val cmdin = Decoupled (new Bundle {
@@ -54,7 +55,7 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
 
   val cacheSize = numOfLine * numOfWay;
 
-  val cache = Mem(Vec(UInt(width = 32), wordsPerLine), cacheSize);
+  val cache = Mem(UInt(width = 32), cacheSize * wordsPerLine);
   val tagArray = Mem(UInt (width = tagWidth), cacheSize);
   val nextWay = Mem(UInt(width = log2Up (numOfWay) + 1), numOfLine);
 
@@ -66,6 +67,8 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
   val we      = Reg (init = Bool(false))
 
   val wdata_from_core = Reg (init = UInt (0,32));
+  io.d_wdata_from_core := wdata_from_core;
+
   val dram_buff = Reg (init = Decoupled(UInt(width = 16)));
 
   val core_buff = Reg (init = Decoupled(UInt(width = 32)));
@@ -87,13 +90,23 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
   io.foo := foo;
   io.bar := bar;
 
+  def hitWay (varTag : UInt, varIndex : UInt) : UInt = {
+    for (i <- 0 until numOfWay ) {
+      when (varTag === tagArray ((varIndex << wayBits) + UInt(i))) {
+        return UInt(i);
+      }
+    }
+    return UInt (numOfWay);
+  }
+
   switch (state) {
     is (ready) {
       when (io.cmdin.valid) {
         val varIndex = io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,wordsWidth);
         val varTag = io.cmdin.bits.addr.apply(20,indexWidth + wordsWidth);
-        val nowWay = Mux(varTag === tagArray((varIndex << wayBits) + UInt(0)),UInt (0),
+        val nowWay = Mux(varTag === tagArray((varIndex << wayBits) +p UInt(0)),UInt (0),
           Mux (varTag === tagArray((varIndex << wayBits) + UInt(1)),UInt (1),UInt(2)))
+//        val nowWay = hitWay (varTag,varIndex);
         // for (i <- 0 to numOfWay - 1) {
         //     when (varTag === tagArray ((varIndex << wayBits) + UInt(i))) {
         //       nowWay = i
@@ -113,16 +126,16 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
         bar  := tagArray((varIndex << wayBits) + UInt(1));
 
         when (nowWay != UInt(numOfWay)) {
-          var tmp_posInLine = io.cmdin.bits.addr.apply (wordsWidth - 1,0)
+          val tmp_posInLine = io.cmdin.bits.addr.apply (wordsWidth - 1,0)
           dram_buff.valid := Bool (false)
           when (io.cmdin.bits.we) {
             // write
             when (io.wdataFromCore.valid) {
-              cache ((varIndex << wayBits) + nowWay)(tmp_posInLine) := io.wdataFromCore.bits
+              cache ((varIndex << (wayBits + lineBits)) + (nowWay << lineBits) + tmp_posInLine) := io.wdataFromCore.bits
             }
           } .otherwise {
             // read
-            core_buff.bits := cache ((varIndex << wayBits) + nowWay)(tmp_posInLine)
+            core_buff.bits := cache ((varIndex << (wayBits + lineBits)) + (nowWay << lineBits) + tmp_posInLine)
             core_buff.valid := Bool(true)
           }
         } .otherwise {
@@ -134,7 +147,7 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           // burst access
           when (io.cmdin.bits.we) {
             // tag index words
-            var tmp_index = io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,wordsWidth)
+            val tmp_index = io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,wordsWidth)
             addr := tagArray ((tmp_index << wayBits) + nextWay (tmp_index)) ## io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,0) ## UInt (0)
           }.otherwise {
             addr := io.cmdin.bits.addr ## UInt (0)
@@ -146,8 +159,9 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           posInLine := io.cmdin.bits.addr.apply (wordsWidth - 1,0)
 
           when (io.cmdin.bits.we) {
-            dram_buff.bits := cache (index << wordsWidth) (0).apply (15,0)
+            dram_buff.bits := cache ((varIndex << (wayBits + lineBits)) + (nextWay (index) << lineBits) + UInt(0))
             dram_buff.valid := Bool(true)
+            wdata_from_core := io.wdataFromCore.bits;
           }
         }
       }
@@ -157,18 +171,18 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
         count := time
         when (we === Bool(false) && io.rdataToDRAM.valid) {
           when (wordCnt (0) === UInt (0)) {
-            cache ((index << wayBits) + nextWay (index))(wordCnt (wordsWidth,1)).apply(15,0) := io.rdataToDRAM.bits
+            cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + wordCnt (wordsWidth,1)).apply(15,0) := io.rdataToDRAM.bits
           }.otherwise {
-            cache ((index << wayBits) + nextWay (index))(wordCnt (wordsWidth,1)).apply(31,16) := io.rdataToDRAM.bits
+            cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + wordCnt (wordsWidth,1)).apply(31,16) := io.rdataToDRAM.bits
           }
         }
 
         // finish
         when (wordCnt === UInt(7)) {
           when (we) {
-            cache ((index << wayBits) + nextWay (index))(posInLine) := wdata_from_core
+            cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + posInLine) := wdata_from_core
           }.otherwise {
-            core_buff.bits := cache ((index << wayBits) + nextWay (index))(posInLine);
+            core_buff.bits := cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + posInLine);
             core_buff.valid := Bool(true)
           }
           state := ready
@@ -185,9 +199,9 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
 
         when (we) {
           when (wordCnt (0) === UInt (0)) {
-            dram_buff.bits := cache ((index << wayBits) + nextWay (index))(wordCnt (wordsWidth,1)).apply(15,0)
+            dram_buff.bits := cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + wordCnt (wordsWidth,1)).apply(15,0)
           }.otherwise {
-            dram_buff.bits := cache ((index << wayBits) + nextWay (index))(wordCnt (wordsWidth,1)).apply(31,16)
+            dram_buff.bits := cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + wordCnt (wordsWidth,1)).apply(31,16)
           }
           dram_buff.valid := Bool(true)
         }
