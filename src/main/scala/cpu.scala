@@ -3,8 +3,414 @@ import Chisel._
 class CPU extends Module {
 
   val io = new Bundle {
+
   }
 
+  val f = Reg(new Bundle {
+    val nextpc = UInt(width = 32)
+  })
+
+  val d = Reg(new Bundle {
+    val opcode = UInt(width = 4)
+    val reg_dest = UInt(width = 5)
+    val reg_a = UInt(width = 5)
+    val reg_b = UInt(width = 5)
+    val data_x = UInt(width = 32)
+    val data_a = UInt(width = 32)
+    val data_b = UInt(width = 32)
+    val data_l = UInt(width = 8)
+    val data_d = UInt(width = 32)
+    val tag = UInt(width = 5)
+    val nextpc = UInt(width = 32)
+    val alu_write = Bool()
+    val misc_write = Bool()
+    val mem_write = Bool()
+    val mem_read = Bool()
+    val mem_byte = Bool()
+    val pc_addr = UInt(width = 32)
+    val pc_src = Bool()
+  })
+
+  val e = Reg(new Bundle {
+    val alu_dest = UInt(width = 5)
+    val alu_write = Bool()
+    val misc_res = UInt(width = 32)
+    val misc_dest = UInt(width = 5)
+    val misc_write = Bool()
+    val mem_addr = UInt(width = 32)
+    val mem_write = Bool()
+    val mem_read = Bool()
+    val mem_byte = Bool()
+  })
+
+  val m = Reg(new Bundle {
+    val res = UInt(width = 32)
+    val reg_dest = UInt(width = 5)
+    val reg_write = Bool()
+    val reg_mem = Bool()
+  })
+
+  val flag = Reg(new Bundle {
+    val int_en = Bool()
+    val int_pc = UInt(width = 32)
+    val int_cause = UInt(width = 32)
+    val int_handler = Uint(width = 32)
+    val vmm_en = Bool()
+    val vmm_pd = Bool()
+    val eoi = Bool()
+  })
+
+
+  def hazard_unit {
+    val op = io.i_data(31, 28)
+    val reg_x = io.i_data(27, 23)
+    val reg_a = io.i_data(22, 18)
+    val reg_b = Mux(op === op_alu, io.i_data(17, 13), UInt(0))
+
+    stall := Bool(false)
+
+    // load hazard
+    when (op === op_st || op === op_stb) {
+      when (d.mem_read && d.reg_dest && (d.reg_dest === reg_x || d.reg_dest === reg_a)) {
+        stall := Bool(true)
+      }
+    } .otherwise {
+      when (d.mem_read && d.reg_dest && (d.reg_dest === reg_a || d.reg_dest === reg_b)) {
+        stall := Bool(true)
+      }
+    }
+
+    // branch hazard
+    switch (op) {
+      is(op_bne, op_beq) {
+        when (d.alu_write && d.reg_dest && (d.reg_dest === reg_x || d.reg_dest === reg_a)) {
+          stall := Bool(true)
+        }
+        when (d.misc_write && d.reg_dest && (d.reg_dest === reg_x || d.reg_dest === reg_a)) {
+          stall := Bool(true)
+        }
+
+        when (e.mem_read && e.misc_dest && (e.misc_dest === reg_x || e.misc_dest === reg_a)) {
+          stall := Bool(true)
+        }
+      }
+      is(op_jr) {
+        when (d.alu_write && d.reg_dest && d.reg_dest === reg_a) {
+          stall := Bool(true)
+        }
+        when (d.misc_write && d.reg_dest && d.reg_dest === reg_a) {
+          stall := Bool(true)
+        }
+
+        when (e.mem_read && e.misc_dest && e.misc_dest === reg_a) {
+          stall := Bool(true)
+        }
+      }
+      is(op_sysenter, op_sysexit) {
+        when (d.mem_write || d.mem_read) {
+          stall := Bool(true)
+        }
+      }
+    }
+
+    // trap hazard
+    when (io.int_go) {
+      when (d.mem_write || d.mem_read) {
+        stall := Bool(true)
+      }
+    }
+  }
+
+  def detect_branch (rf: Vec, int_hdr: UInt, int_pc: UInt, pc_src: Bool, pc_addr: UInt) {
+    val op = io.i_data(31, 28)
+    val reg_x = io.i_data(27, 23)
+    val reg_a = io.i_data(22, 18)
+
+    def forward (reg: UInt, data: UInt) {
+      // perform forwarding, but results may be wrong...
+      when (e.misc_write && e.misc_dest && e.misc_dest === reg) {
+        data := e.misc_res
+      } .elsewhen (e.alu_write && e.alu_dest && e.alu_dest === reg) {
+        data := io.alu_res
+      } .otherwise {
+        data := rf(reg)
+      }
+    }
+
+    forward(reg_x, data_x)
+    forward(reg_a, data_a)
+
+    switch (op) {
+      is (op_jl, op_bne, op_beq) {
+        pc_addr := f.nextpc + (io.i_data(15, 0) << 2)
+      }
+      is (op_jr) {
+        pc_addr := data_a
+      }
+      is (op_sysenter) {
+        pc_addr := int_hdr
+      }
+      is (op_sysexit) {
+        pc_addr := int_pc
+      }
+    }
+
+    pc_src := UInt(0)
+
+    switch (op) {
+      is (op_jl, op_jr, op_sysenter, op_sysexit) {
+        pc_src := Bool(true)
+      }
+      is (op_bne) {
+        pc_src := data_x != data_a
+      }
+      is (op_beq) {
+        pc_src := data_x === data_a
+      }
+    }
+  }
+
+  def trap_unit (int_en: Bool) {
+    val op = io.i_data(31, 28)
+
+    flag.eoi := Bool(false)
+
+    unless (io.d_stall || flag.eoi || stall || d.pc_src) {
+      val nexteoi = (! flag.eoi && int_en && io.int_go)
+
+      when (nexteoi) {
+        flag.int_cause := io.int_cause
+        flag.int_pc := f.nextpc
+        flag.int_en := Bool(false)
+      } .elsewhen (op === op_sysenter) {
+        flag.int_cause := UInt("h00000003")
+        flag.int_pc := f.nextpc
+        flag.int_en := Bool(false)
+      } .elsewhen (op === op_sysexit) {
+        flag.int_en := Bool(true)
+      }
+
+      flag.eoi := nexteoi
+    }
+  }
+
+  def write_unit {
+    when (m.reg_write) {
+      for (i <- 1 to 31) {
+        when (m.reg_dest === UInt(i)) {
+          regfile(UInt(i)) := Mux(m.reg_mem, io.d_data, m.res)
+        }
+      }
+    }
+  }
+
+  def memory_unit {
+    val addr = e.mem_addr
+    val data = e.misc_res
+    val we = e.mem_write
+    val re = e.mem_read
+
+    m.reg_write := e.alu_write || e.misc_write
+
+    when (e.alu_write) {
+      m.res := io.alu_res
+      m.reg_dest := e.alu_dest
+    } .elsewhen (e.misc_write) {
+      m.res := e.misc_res
+      m.reg_dest := e.misc_dest
+    }
+
+    when (UInt("h80001100") <= addr && addr <= UInt("h80002000")) {
+      m.reg_mem := Bool(false)
+    } .otherwise {
+      m.reg_mem := e.mem_read
+    }
+
+    when (re) {
+      switch (addr) {
+        is(UInt("h80001100")) {
+          m.res := flag.int_handler
+        }
+        is(UInt("h80001104")) {
+          m.res := flag.int_en
+        }
+        is(UInt("h80001108")) {
+          m.res := flag.int_pc
+        }
+        is(UInt("h8000110C")) {
+          m.res := flag.int_cause
+        }
+        is(UInt("h80001200")) {
+          m.res := flag.vmm_en
+        }
+        is(UInt("h80001204")) {
+          m.res := flag.vmm_pd
+        }
+      }
+    }
+
+    when (we) {
+      switch (addr) {
+        is(UInt("h80001100")) {
+          flag.int_handler := data
+        }
+        is(UInt("h80001104")) {
+          flag.int_en := data(0)
+        }
+        is(UInt("h80001108")) {
+          flag.int_pc := data
+        }
+        is(UInt("h8000110C")) {
+          flag.int_cause := data
+        }
+        is(UInt("h80001200")) {
+          flag.vmm_en := data(0)
+        }
+        is(UInt("h80001204")) {
+          flag.vmm_pd := data
+        }
+      }
+    }
+
+    cai := (addr === UInt("h80001200") || addr == UInt("h80001204")) && we
+
+    when (io.d_stall) {
+      m.reg_write := Bool(false)
+    }
+  }
+
+  def execute_unit {
+
+    def data_forward (reg_src: UInt, reg_data: UInt, res: UInt) {
+      when (e.misc_write && e.misc_dest && e.misc_dest === reg_src) {
+        res := e.misc_res
+      } .elsewhen (e.alu_write && e.alu_dest && e.alu_dest === reg_src) {
+        res := io.alu_res
+      } .elsewhen (m.reg_write && m.reg_dest && m.reg_dest === reg_src) {
+        res := Mux(m.reg_mem, io.d_data, m.res)
+      } .otherwise {
+        res := reg_data
+      }
+    }
+
+    data_forward(d.reg_a, d.data_a, data_a)
+    data_forward(d.reg_b, d.data_b, data_b)
+    data_forward(d.reg_dest, d.data_x, data_x)
+
+    unless (io.d_stall) {
+      e.mem_addr := Mux(d.mem_byte, data_a + d.data_d, data_a + (d.data_d << 2))
+      e.mem_write := d.mem_write
+      e.mem_read := d.mem_read
+      e.mem_byte := d.mem_byte
+
+      // alu
+      e.alu_write := d.alu_write
+      e.alu_dest := d.alu_dest
+
+      // misc
+      switch (d.opcode) {
+        is(op_ldl) {
+          e.misc_res := d.data_d
+        }
+        is(op_ldh) {
+          e.misc_res := Cat(d.data_d(15, 0), data_a(15, 0))
+        }
+        is(op_jl, op_jr) {
+          e.misc_res := d.nextpc
+        }
+        is(op_st, op_stb) {
+          e.misc_res := data_x
+        }
+      }
+      e.misc_write := d.misc_write
+      e.misc_dest := d.reg_dest
+    }
+
+    when (! io.d_stall && flag.eoi) { // flush operation if it came from *previous* ID
+      e.alu_write := Bool(false)
+      e.misc_write := Bool(false)
+      e.mem_write := Bool(false)
+      e.mem_read := Bool(false)
+    }
+  }
+
+  def decode_unit {
+    // val inst = UInt(0, width = 32)
+
+    // // TODO: this circuit should be moved to icache
+    // unless (io.i_stall) {
+    //   inst := Mux(f.inst_src, f.inst, io.i_data)
+    // }
+
+    val op = io.i_data(31, 28)
+
+    unless (io.d_stall) {
+      d.opcode := op
+      d.reg_dest := io.i_data(27, 23)
+      d.reg_a := io.i_data(22, 18)
+      d.reg_b := io.i_data(17, 13)
+      d.data_l := io.i_data(12, 5)
+      d.data_d := io.i_data(15, 0)
+      d.tag := io.i_data(4, 0)
+
+      d.nextpc := f.nextpc
+      d.alu_write := op === op_alu
+      d.misc_write := Vec(op_ldl, op_ldh, op_ld, op_ldb, op_jl, op_jr).contains(op)
+      d.mem_write := Vec(op_st, op_stb).contains(op)
+      d.mem_read := Vec(op_ld, op_ldb).contains(op)
+      d.mem_byte := Vec(op_ldb, op_stb).contains(op)
+
+      detect_branch
+    }
+
+    when ((! io.d_stall && (stall || d.pc_src)) || flag.eoi) {
+      d.alu_write := Bool(false)
+      d.misc_write := Bool(false)
+      d.mem_write := Bool(false)
+      d.mem_read := Bool(false)
+      d.pc_src := Bool(false)
+    }
+
+    d.data_x := ;
+    d.data_a := ;
+    d.data_b := ;
+  }
+
+  def fetch_unit {
+    val pc = UInt(0, width = 32)
+
+    when (eoi) {
+      pc := flag.int_handler
+    } .elsewhen (d.pc_src) {
+      pc := d.pc_addr
+    } .otherwise {
+      pc := f.nextpc
+    }
+
+    unless (stall || io.d_stall || io.i_stall) {
+      f.nextpc := pc + UInt(4)
+    }
+
+    // // TODO: this circuit should be moved to icache
+    // f.inst_src := (! eoi && ! d.pc_src && (stall || io.d_stall) && ! io.i_stall)
+    // f.inst := inst
+  }
+
+  val stall = Bool(false)
+
+  hazard_unit
+
+  write_unit
+
+  memory_unit
+
+  execute_unit
+
+  decode_unit
+
+  fetch_unit
+
+  trap_unit
 }
 
 class CPUTests(c: CPU) extends Tester(c) {
@@ -18,769 +424,3 @@ object CPU {
     }
   }
 }
-
-/*
-architecture Behavioral of cpu is
-
-  type regfile_type is
-    array(0 to 31) of std_logic_vector(31 downto 0);
-
-  type fetch_reg_type is record
-    pc     : std_logic_vector(31 downto 0);
-    nextpc : std_logic_vector(31 downto 0);
-    inst_src : std_logic;
-    inst   : std_logic_vector(31 downto 0);
-  end record;
-
-  type decode_reg_type is record
-    opcode     : std_logic_vector(3 downto 0);
-    reg_dest   : std_logic_vector(4 downto 0);
-    reg_a      : std_logic_vector(4 downto 0);
-    reg_b      : std_logic_vector(4 downto 0);
-    data_x     : std_logic_vector(31 downto 0);
-    data_a     : std_logic_vector(31 downto 0);
-    data_b     : std_logic_vector(31 downto 0);
-    data_l     : std_logic_vector(7 downto 0);
-    data_d     : std_logic_vector(31 downto 0);
-    tag        : std_logic_vector(4 downto 0);
-    signop     : std_logic_vector(1 downto 0);
-    nextpc     : std_logic_vector(31 downto 0);
-    alu_write  : std_logic;
-    fpu_write  : std_logic;
-    misc_write : std_logic;
-    mem_write  : std_logic;
-    mem_read   : std_logic;
-    mem_byte   : std_logic;
-    pc_addr    : std_logic_vector(31 downto 0);
-    pc_src     : std_logic;
-  end record;
-
-  type execute_reg_type is record
-    alu_dest   : std_logic_vector(4 downto 0);
-    alu_write  : std_logic;
-    fpu_dest   : std_logic_vector(4 downto 0);
-    fpu_write  : std_logic;
-    fpu_dest1  : std_logic_vector(4 downto 0);
-    fpu_write1 : std_logic;
-    fpu_dest2  : std_logic_vector(4 downto 0);
-    fpu_write2 : std_logic;
-    misc_res   : std_logic_vector(31 downto 0);
-    misc_dest  : std_logic_vector(4 downto 0);
-    misc_write : std_logic;
-    mem_addr   : std_logic_vector(31 downto 0);
-    mem_write  : std_logic;
-    mem_read   : std_logic;
-    mem_byte   : std_logic;
-  end record;
-
-  type memory_reg_type is record
-    res       : std_logic_vector(31 downto 0);
-    reg_dest  : std_logic_vector(4 downto 0);
-    reg_write : std_logic;
-    reg_mem   : std_logic;
-  end record;
-
-  type flag_type is record
-    int_en      : std_logic;
-    int_pc      : std_logic_vector(31 downto 0);
-    int_cause   : std_logic_vector(31 downto 0);
-    int_handler : std_logic_vector(31 downto 0);
-    vmm_en      : std_logic;
-    vmm_pd      : std_logic_vector(31 downto 0);
-  end record;
-
-  type reg_type is record
-    regfile : regfile_type;
-    f       : fetch_reg_type;
-    d       : decode_reg_type;
-    e       : execute_reg_type;
-    m       : memory_reg_type;
-    flag    : flag_type;
-    eoi     : std_logic;
-  end record;
-
-  constant fzero : fetch_reg_type := (
-    pc     => (others => '0'),
-    nextpc => x"80000000",
-    inst_src => '0',
-    inst   => (others => '0')
-    );
-
-  constant dzero : decode_reg_type := (
-    opcode     => "0000",
-    reg_dest   => "00000",
-    reg_a      => "00000",
-    reg_b      => "00000",
-    data_x     => (others => '0'),
-    data_a     => (others => '0'),
-    data_b     => (others => '0'),
-    data_l     => (others => '0'),
-    data_d     => (others => '0'),
-    tag        => "00000",
-    signop     => "00",
-    nextpc     => (others => '0'),
-    alu_write  => '0',
-    fpu_write  => '0',
-    misc_write => '0',
-    mem_write  => '0',
-    mem_read   => '0',
-    mem_byte   => '0',
-    pc_addr    => (others => '0'),
-    pc_src     => '0'
-    );
-
-  constant ezero : execute_reg_type := (
-    alu_dest   => (others => '0'),
-    alu_write  => '0',
-    fpu_dest   => (others => '0'),
-    fpu_write  => '0',
-    fpu_dest1  => (others => '0'),
-    fpu_write1 => '0',
-    fpu_dest2  => (others => '0'),
-    fpu_write2 => '0',
-    misc_res   => (others => '0'),
-    misc_dest  => "00000",
-    misc_write => '0',
-    mem_addr   => (others => '0'),
-    mem_write  => '0',
-    mem_read   => '0',
-    mem_byte   => '0'
-    );
-
-  constant mzero : memory_reg_type := (
-    res       => (others => '0'),
-    reg_dest  => "00000",
-    reg_write => '0',
-    reg_mem   => '0'
-    );
-
-  constant flag_zero : flag_type := (
-    int_en      => '0',
-    int_pc      => (others => '0'),
-    int_cause   => (others => '0'),
-    int_handler => (others => '0'),
-    vmm_en      => '0',
-    vmm_pd      => (others => '0')
-    );
-
-  constant rzero : reg_type := (
-    regfile => (others => (others => '0')),
-    f       => fzero,
-    d       => dzero,
-    e       => ezero,
-    m       => mzero,
-    flag    => flag_zero,
-    eoi     => '0'
-    );
-
-  signal r, rin : reg_type := rzero;
-
-
-  procedure data_forward (
-    reg_src  : in  std_logic_vector(4 downto 0);
-    reg_data : in  std_logic_vector(31 downto 0);
-    res      : out std_logic_vector(31 downto 0)) is
-  begin
-    if r.e.misc_write = '1' and r.e.misc_dest /= "00000" and r.e.misc_dest = reg_src then
-      res := r.e.misc_res;
-    elsif r.e.alu_write = '1' and r.e.alu_dest /= "00000" and r.e.alu_dest = reg_src then
-      res := cpu_in.alu_res;
-    elsif r.e.fpu_write = '1' and r.e.fpu_dest /= "00000" and r.e.fpu_dest = reg_src then
-      res := cpu_in.fpu_res;
-    elsif r.m.reg_write = '1' and r.m.reg_dest /= "00000" and r.m.reg_dest = reg_src then
-      if r.m.reg_mem = '1' then
-        res := cpu_in.d_data;
-      else
-        res := r.m.res;
-      end if;
-    else
-      res := reg_data;
-    end if;
-  end procedure;
-
-
-  procedure detect_hazard (
-    inst  : in  std_logic_vector(31 downto 0);
-    stall : out std_logic) is
-
-    variable opcode : std_logic_vector(3 downto 0);
-    variable reg_x  : std_logic_vector(4 downto 0);
-    variable reg_a  : std_logic_vector(4 downto 0);
-    variable reg_b  : std_logic_vector(4 downto 0);
-
-  begin
-
-    -- micro decoder
-    opcode := inst(31 downto 28);
-    reg_x  := inst(27 downto 23);
-    reg_a  := inst(22 downto 18);
-    case opcode is
-      when OP_ALU | OP_FPU =>
-        reg_b := inst(17 downto 13);
-      when others =>
-        reg_b := "00000";
-    end case;
-
-    stall := '0';
-
-    -- load stall
-    case opcode is
-      when OP_ST | OP_STB =>
-        if r.d.mem_read = '1' and r.d.reg_dest /= "00000" and (r.d.reg_dest = reg_x or r.d.reg_dest = reg_a) then
-          stall := '1';
-        end if;
-      when others =>
-        if r.d.mem_read = '1' and r.d.reg_dest /= "00000" and (r.d.reg_dest = reg_a or r.d.reg_dest = reg_b) then
-          stall := '1';
-        end if;
-    end case;
-
-    -- fpu pipeline RAW hazard
-    case opcode is
-      when OP_ST | OP_STB =>
-        if r.d.fpu_write = '1' and r.d.reg_dest /= "00000" and r.d.reg_dest = reg_x then
-          stall := '1';
-        end if;
-        if r.e.fpu_write2 = '1' and r.e.fpu_dest2 /= "00000" and r.e.fpu_dest2 = reg_x then
-          stall := '1';
-        end if;
-        if r.d.fpu_write = '1' and r.d.reg_dest /= "00000" and r.d.reg_dest = reg_a then
-          stall := '1';
-        end if;
-        if r.e.fpu_write2 = '1' and r.e.fpu_dest2 /= "00000" and r.e.fpu_dest2 = reg_a then
-          stall := '1';
-        end if;
-      when others =>
-        if r.d.fpu_write = '1' and r.d.reg_dest /= "00000" and r.d.reg_dest = reg_a then
-          stall := '1';
-        end if;
-        if r.e.fpu_write2 = '1' and r.e.fpu_dest2 /= "00000" and r.e.fpu_dest2 = reg_a then
-          stall := '1';
-        end if;
-        if r.d.fpu_write = '1' and r.d.reg_dest /= "00000" and r.d.reg_dest = reg_b then
-          stall := '1';
-        end if;
-        if r.e.fpu_write2 = '1' and r.e.fpu_dest2 /= "00000" and r.e.fpu_dest2 = reg_b then
-          stall := '1';
-        end if;
-    end case;
-
-    -- fpu pipeline WAR/WAW hazard
-    case opcode is
-      when OP_ALU | OP_LDL | OP_LDH | OP_LD | OP_LDB | OP_JL | OP_JR =>
-        if r.e.fpu_write2 = '1' and r.e.fpu_dest2 /= "00000" then
-          stall := '1';                 -- avoid structual hazard at WB stage (double write)
-        end if;
-        if r.d.fpu_write = '1' and r.d.reg_dest /= "00000" and r.d.reg_dest = reg_x then
-          stall := '1';
-        end if;
-      when others =>
-    end case;
-
-    -- branch hazard
-    case opcode is
-      when OP_BNE | OP_BEQ =>
-        if r.d.alu_write = '1' and r.d.reg_dest /= "00000" and (r.d.reg_dest = reg_x or r.d.reg_dest = reg_a) then
-          stall := '1';
-        end if;
-        if r.d.fpu_write = '1' and r.d.reg_dest /= "00000" and (r.d.reg_dest = reg_x or r.d.reg_dest = reg_a) then
-          stall := '1';
-        end if;
-        if r.d.misc_write = '1' and r.d.reg_dest /= "00000" and (r.d.reg_dest = reg_x or r.d.reg_dest = reg_a) then
-          stall := '1';
-        end if;
-
-        if r.e.fpu_write1 = '1' and r.e.fpu_dest1 /= "00000" and (r.e.fpu_dest1 = reg_x or r.e.fpu_dest1 = reg_a) then
-          stall := '1';
-        end if;
-        if r.e.fpu_write2 = '1' and r.e.fpu_dest2 /= "00000" and (r.e.fpu_dest2 = reg_x or r.e.fpu_dest2 = reg_a) then
-          stall := '1';
-        end if;
-
-        if r.e.mem_read = '1' and r.e.misc_dest /= "00000" and (r.e.misc_dest = reg_x or r.e.misc_dest = reg_a) then
-          stall := '1';
-        end if;
-      when OP_JR =>
-        if r.d.alu_write = '1' and r.d.reg_dest /= "00000" and r.d.reg_dest = reg_a then
-          stall := '1';
-        end if;
-        if r.d.fpu_write = '1' and r.d.reg_dest /= "00000" and r.d.reg_dest = reg_a then
-          stall := '1';
-        end if;
-        if r.d.misc_write = '1' and r.d.reg_dest /= "00000" and r.d.reg_dest = reg_a then
-          stall := '1';
-        end if;
-
-        if r.e.fpu_write1 = '1' and r.e.fpu_dest1 /= "00000" and r.e.fpu_dest1 = reg_a then
-          stall := '1';
-        end if;
-        if r.e.fpu_write2 = '1' and r.e.fpu_dest2 /= "00000" and r.e.fpu_dest2 = reg_a then
-          stall := '1';
-        end if;
-
-        if r.e.mem_read = '1' and r.e.misc_dest /= "00000" and r.e.misc_dest = reg_a then
-          stall := '1';
-        end if;
-      when OP_SYSENTER | OP_SYSEXIT =>
-        if r.d.mem_write = '1' or r.d.mem_read = '1' then
-          stall := '1';
-        end if;
-      when others =>
-    end case;
-
-    -- interrupt hazard
-    if cpu_in.int_go = '1' then
-      if r.d.mem_write = '1' or r.d.mem_read = '1' then
-        stall := '1';
-      end if;
-    end if;
-
-  end procedure;
-
-
-  procedure detect_branch (
-    inst    : in  std_logic_vector(31 downto 0);
-    regfile : in  regfile_type;
-    int_hdr : in  std_logic_vector(31 downto 0);
-    int_pc  : in  std_logic_vector(31 downto 0);
-    pc_src  : out std_logic;
-    pc_addr : out std_logic_vector(31 downto 0)) is
-
-    variable opcode : std_logic_vector(3 downto 0);
-    variable reg_x  : std_logic_vector(4 downto 0);
-    variable reg_a  : std_logic_vector(4 downto 0);
-    variable data_x : std_logic_vector(31 downto 0);
-    variable data_a : std_logic_vector(31 downto 0);
-
-  begin
-
-    opcode := inst(31 downto 28);
-    reg_x  := inst(27 downto 23);
-    reg_a  := inst(22 downto 18);
-
-    -- forwarding, but results may be wrong...
-    if r.e.misc_write = '1' and r.e.misc_dest /= "00000" and r.e.misc_dest = reg_x then
-      data_x := r.e.misc_res;
-    elsif r.e.alu_write = '1' and r.e.alu_dest /= "00000" and r.e.alu_dest = reg_x then
-      data_x := cpu_in.alu_res;
-    elsif r.e.fpu_write = '1' and r.e.fpu_dest /= "00000" and r.e.fpu_dest = reg_x then
-      data_x := cpu_in.fpu_res;
-    else
-      data_x := regfile(conv_integer(reg_x));
-    end if;
-
-    if r.e.misc_write = '1' and r.e.misc_dest /= "00000" and r.e.misc_dest = reg_a then
-      data_a := r.e.misc_res;
-    elsif r.e.alu_write = '1' and r.e.alu_dest /= "00000" and r.e.alu_dest = reg_a then
-      data_a := cpu_in.alu_res;
-    elsif r.e.fpu_write = '1' and r.e.fpu_dest /= "00000" and r.e.fpu_dest = reg_a then
-      data_a := cpu_in.fpu_res;
-    else
-      data_a := regfile(conv_integer(reg_a));
-    end if;
-
-    case opcode is
-      when OP_JL | OP_BNE | OP_BEQ =>
-        pc_addr := r.f.nextpc + (repeat(inst(15), 14) & inst(15 downto 0) & "00");
-      when OP_JR =>
-        pc_addr := data_a;
-      when OP_SYSENTER =>
-        pc_addr := int_hdr;
-      when OP_SYSEXIT =>
-        pc_addr := int_pc;
-      when others =>
-        pc_addr := (others => '-');
-    end case;
-
-    case opcode is
-      when OP_JL | OP_JR | OP_SYSENTER | OP_SYSEXIT =>
-        pc_src := '1';
-      when OP_BNE =>
-        pc_src := to_std_logic(data_x /= data_a);
-      when OP_BEQ =>
-        pc_src := to_std_logic(data_x = data_a);
-      when others =>
-        pc_src := '0';
-    end case;
-
-  end procedure;
-
-
-  procedure detect_interrupt (
-    int_en : in  std_logic;
-    eoi    : out std_logic) is
-  begin
-    if r.eoi = '0' and int_en = '1' and cpu_in.int_go = '1' then
-      eoi := '1';
-    else
-      eoi := '0';
-    end if;
-  end procedure;
-
-
-begin
-
-  comb : process(r, cpu_in) is
-    variable v : reg_type;
-
-    -- decode
-    variable inst : std_logic_vector(31 downto 0);
-    variable stall : std_logic;
-
-    -- write
-    variable res : std_logic_vector(31 downto 0);
-
-    -- execute
-    variable data_a  : std_logic_vector(31 downto 0);
-    variable data_b  : std_logic_vector(31 downto 0);
-    variable data_x  : std_logic_vector(31 downto 0);
-    variable data_bl : std_logic_vector(31 downto 0);
-
-    -- external
-    variable i_addr : std_logic_vector(31 downto 0);
-    variable i_re   : std_logic;
-    variable d_addr : std_logic_vector(31 downto 0);
-    variable d_val  : std_logic_vector(31 downto 0);
-    variable d_we   : std_logic;
-    variable d_re   : std_logic;
-    variable d_b    : std_logic;
-    variable cai    : std_logic;
-  begin
-    v := r;
-
-    -- WRITE
-
-    if r.m.reg_mem = '1' then
-      res := cpu_in.d_data;
-    else
-      res := r.m.res;
-    end if;
-
-    if r.m.reg_write = '1' then
-      for i in 1 to 31 loop
-        if r.m.reg_dest = i then
-          v.regfile(i) := res;
-        end if;
-      end loop;
-    end if;
-
-    -- MEMORY
-
-    d_addr := r.e.mem_addr;
-    d_val  := r.e.misc_res;
-    d_we   := r.e.mem_write;
-    d_re   := r.e.mem_read;
-    d_b    := r.e.mem_byte;
-
-    assert not (r.e.alu_write = '1' and r.e.fpu_write = '1') severity failure;
-    assert not (r.e.fpu_write = '1' and r.e.misc_write = '1') severity failure;
-    assert not (r.e.misc_write = '1' and r.e.alu_write = '1') severity failure;
-
-    if r.e.alu_write = '1' then
-      v.m.res       := cpu_in.alu_res;
-      v.m.reg_dest  := r.e.alu_dest;
-      v.m.reg_write := '1';
-    elsif r.e.fpu_write = '1' then
-      v.m.res       := cpu_in.fpu_res;
-      v.m.reg_dest  := r.e.fpu_dest;
-      v.m.reg_write := '1';
-    elsif r.e.misc_write = '1' then
-      v.m.res       := r.e.misc_res;
-      v.m.reg_dest  := r.e.misc_dest;
-      v.m.reg_write := '1';
-    else
-      v.m.reg_write := '0';
-    end if;
-
-    if x"80001100" <= d_addr and d_addr < x"80002000" then
-      v.m.reg_mem := '0';
-    else
-      v.m.reg_mem := r.e.mem_read;
-    end if;
-
-    if d_re = '1' then
-      case d_addr is
-        when x"80001100" =>
-          v.m.res := r.flag.int_handler;
-        when x"80001104" =>
-          v.m.res := repeat('0', 31) & r.flag.int_en;
-        when x"80001108" =>
-          v.m.res := r.flag.int_pc;
-        when x"8000110C" =>
-          v.m.res := r.flag.int_cause;
-        when x"80001200" =>
-          v.m.res := repeat('0', 31) & r.flag.vmm_en;
-        when x"80001204" =>
-          v.m.res := r.flag.vmm_pd;
-        when others =>
-      end case;
-    end if;
-
-    if d_we = '1' then
-      case d_addr is
-        when x"80001100" =>
-          v.flag.int_handler := d_val;
-        when x"80001104" =>
-          v.flag.int_en := d_val(0);
-        when x"80001108" =>
-          v.flag.int_pc := d_val;
-        when x"8000110C" =>
-          v.flag.int_cause := d_val;
-        when x"80001200" =>
-          v.flag.vmm_en := d_val(0);
-        when x"80001204" =>
-          v.flag.vmm_pd := d_val;
-        when others =>
-      end case;
-    end if;
-
-    if (d_addr = x"80001200" or d_addr = x"80001204") and d_we = '1' then
-      cai := '1';
-    else
-      cai := '0';
-    end if;
-
-    if cpu_in.d_stall = '1' then
-      v.m.reg_write := '0';
-    end if;
-
-    -- EXECUTE
-
-    data_forward(r.d.reg_a, r.d.data_a, data_a);
-    data_forward(r.d.reg_b, r.d.data_b, data_b);
-    data_forward(r.d.reg_dest, r.d.data_x, data_x);
-
---pragma synthesis_off
-    if is_x(data_a) then data_a := (others => '0'); end if;
-    if is_x(data_b) then data_b := (others => '0'); end if;
-    if is_x(data_x) then data_x := (others => '0'); end if;
---pragma synthesis_on
-
-    --// MISC
-
-    case r.d.opcode is
-      when OP_LDL =>
-        v.e.misc_res := r.d.data_d;
-      when OP_LDH =>
-        v.e.misc_res := r.d.data_d(15 downto 0) & data_a(15 downto 0);
-      when OP_JL | OP_JR =>
-        v.e.misc_res := r.d.nextpc;
-      when OP_ST | OP_STB =>
-        v.e.misc_res := data_x;
-      when others =>
-        v.e.misc_res := (others => '-');
-    end case;
-    v.e.misc_dest  := r.d.reg_dest;
-    v.e.misc_write := r.d.misc_write;
-
-    if r.d.mem_byte = '1' then
-      v.e.mem_addr := data_a + r.d.data_d;
-    else
-      v.e.mem_addr := data_a + (r.d.data_d(29 downto 0) & "00");
-    end if;
-    v.e.mem_write  := r.d.mem_write;
-    v.e.mem_read   := r.d.mem_read;
-    v.e.mem_byte   := r.d.mem_byte;
-
-    --// ALU
-
-    v.e.alu_write := r.d.alu_write;
-    v.e.alu_dest  := r.d.reg_dest;
-
-    --// FPU
-
-    v.e.fpu_write2 := r.d.fpu_write;
-    v.e.fpu_dest2  := r.d.reg_dest;
-
-    v.e.fpu_write1 := r.e.fpu_write2;
-    v.e.fpu_dest1  := r.e.fpu_dest2;
-
-    v.e.fpu_write := r.e.fpu_write1;
-    v.e.fpu_dest  := r.e.fpu_dest1;
-
-    if cpu_in.d_stall = '1' then
-      v.e := r.e;
-    end if;
-
-    if cpu_in.d_stall = '0' and r.eoi = '1' then
-      --// flush operation if it came from *previous* ID
-      v.e.alu_write  := '0';
-      v.e.fpu_write2  := '0';
-      v.e.misc_write := '0';
-      v.e.mem_write  := '0';
-      v.e.mem_read   := '0';
-    end if;
-
-    -- DECODE
-
-    if cpu_in.i_stall = '1' then
-      inst := (others => '0');
-    else
-      if r.f.inst_src = '1' then
-        inst := r.f.inst;
-      else
-        inst := cpu_in.i_data;
-      end if;
-    end if;
-
---pragma synthesis_off
-    if is_x(inst) then
-      inst := (others => '0');
-    end if;
---pragma synthesis_on
-
-    v.d.opcode   := inst(31 downto 28);
-    v.d.reg_dest := inst(27 downto 23);
-    v.d.reg_a    := inst(22 downto 18);
-    v.d.reg_b    := inst(17 downto 13);
-    v.d.data_l   := inst(12 downto 5);
-    v.d.data_d   := repeat(inst(15), 16) & inst(15 downto 0);
-    v.d.tag      := inst(4 downto 0);
-    v.d.signop   := inst(6 downto 5);
-    v.d.nextpc   := r.f.nextpc;
-    v.d.alu_write := to_std_logic(v.d.opcode = OP_ALU);
-    v.d.fpu_write := to_std_logic(v.d.opcode = OP_FPU);
-    case v.d.opcode is
-      when OP_LDL | OP_LDH | OP_LD | OP_LDB | OP_JL | OP_JR =>
-        v.d.misc_write := '1';
-      when OP_ALU | OP_FPU | OP_ST | OP_STB | OP_SYSENTER | OP_SYSEXIT | OP_BNE | OP_BEQ =>
-        v.d.misc_write := '0';
-      when others =>
-        v.d.misc_write := '-';
-    end case;
-    v.d.mem_write := to_std_logic(v.d.opcode = OP_ST or v.d.opcode = OP_STB);
-    v.d.mem_read  := to_std_logic(v.d.opcode = OP_LD or v.d.opcode = OP_LDB);
-    v.d.mem_byte  := to_std_logic(v.d.opcode = OP_LDB or v.d.opcode = OP_STB);
-
-    detect_hazard(inst, stall);
-    detect_branch(inst, v.regfile, v.flag.int_handler, v.flag.int_pc, v.d.pc_src, v.d.pc_addr);
-    detect_interrupt(v.flag.int_en, v.eoi);
-
-    if cpu_in.d_stall = '0' and r.eoi = '0' and stall = '0' and r.d.pc_src = '0' then
-      if v.eoi = '1' then
-        v.flag.int_cause := cpu_in.int_cause;
-        v.flag.int_pc    := r.f.nextpc;
-        v.flag.int_en    := '0';
-      elsif v.d.opcode = OP_SYSENTER then
-        v.flag.int_cause := x"00000003";
-        v.flag.int_pc    := r.f.nextpc;
-        v.flag.int_en    := '0';
-      elsif v.d.opcode = OP_SYSEXIT then
-        v.flag.int_en := '1';
-      end if;
-    end if;
-
-    if cpu_in.d_stall = '1' then
-      v.d := r.d;
-      v.eoi := '0';
-    end if;
-
-    if cpu_in.d_stall = '0' and stall = '1' then
-      v.d.alu_write := '0';
-      v.d.fpu_write := '0';
-      v.d.misc_write := '0';
-      v.d.mem_write := '0';
-      v.d.mem_read := '0';
-      v.d.pc_src := '0';
-      v.eoi := '0';
-    end if;
-
-    if cpu_in.d_stall = '0' and stall = '0' and r.d.pc_src = '1' then
-      v.d.alu_write := '0';
-      v.d.fpu_write := '0';
-      v.d.misc_write := '0';
-      v.d.mem_write := '0';
-      v.d.mem_read := '0';
-      v.d.pc_src := '0';
-      v.eoi := '0';
-    end if;
-
-    if r.eoi = '1' then
-      --// flush operations which came from ID and IF
-      v.d.alu_write := '0';
-      v.d.fpu_write := '0';
-      v.d.misc_write := '0';
-      v.d.mem_write := '0';
-      v.d.mem_read := '0';
-      v.d.pc_src := '0';
-      v.eoi := '0';
-    end if;
-
-    --// see http://goo.gl/dhJQ69 for detail
-    v.d.data_x := v.regfile(conv_integer(v.d.reg_dest));
-    v.d.data_a := v.regfile(conv_integer(v.d.reg_a));
-    v.d.data_b := v.regfile(conv_integer(v.d.reg_b));
-
-    -- FETCH
-
-    i_re := '1';
-
-    if r.eoi = '1' then
-      i_addr := r.flag.int_handler;
-    elsif r.d.pc_src = '1' then
-      i_addr := r.d.pc_addr;
-    elsif cpu_in.i_stall = '1' then
-      i_addr := r.f.pc;
-    else
-      i_addr := r.f.nextpc;
-    end if;
-
-    if r.eoi = '1' then
-      v.f.pc := r.flag.int_handler;
-    elsif r.d.pc_src = '1' then
-      v.f.pc := r.d.pc_addr;
-    elsif stall = '1' or cpu_in.d_stall = '1' then
-      v.f.pc := r.f.pc;
-    elsif cpu_in.i_stall = '1' then
-      v.f.pc := r.f.pc;
-    else
-      v.f.pc := r.f.nextpc;
-    end if;
-
-    v.f.nextpc := v.f.pc + 4;
-
-    if ((not r.eoi) and (not r.d.pc_src) and (stall or cpu_in.d_stall)) = '0' then
-      v.f.inst_src := '0';
-    else
-      if cpu_in.i_stall = '1' then
-        v.f.inst_src := '0';
-      else
-        v.f.inst_src := '1';
-        v.f.inst := inst;
-      end if;
-    end if;
-
-    -- END
-
-    rin <= v;
-
-    cpu_out.i_addr <= i_addr;
-    cpu_out.i_re   <= i_re;
-    cpu_out.d_addr <= d_addr;
-    cpu_out.d_data <= d_val;
-    cpu_out.d_we   <= d_we;
-    cpu_out.d_re   <= d_re;
-    cpu_out.d_b    <= d_b;
-    cpu_out.eoi    <= r.eoi;
-    cpu_out.eoi_id <= r.flag.int_cause;
-    cpu_out.cai    <= cai;
-    cpu_out.vmm_en <= r.flag.vmm_en;
-    cpu_out.vmm_pd <= r.flag.vmm_pd;
-    cpu_out.optag  <= r.d.tag;
-    cpu_out.signop <= r.d.signop;
-    cpu_out.data_a <= data_a;
-    cpu_out.data_b <= data_b;
-    cpu_out.data_l <= r.d.data_l;
-  end process;
-
-  regs : process(clk, rst) is
-  begin
-    if rst = '1' then
-      r <= rzero;
-    elsif rising_edge(clk) then
-      r <= rin;
-    end if;
-  end process;
-
-end architecture;
- */
