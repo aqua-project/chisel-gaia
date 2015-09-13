@@ -1,9 +1,61 @@
 import Chisel._
+import ALU._
+
+class ICacheCmd extends Bundle {
+  val req = new Bundle {
+    val addr = UInt(OUTPUT, width = 32)
+  }
+  val res = new Bundle {
+    val stall = Bool(INPUT)
+    val data = UInt(INPUT, width = 32)
+  }
+}
+
+class DCacheCmd extends Bundle {
+  val req = new Bundle {
+    val addr = UInt(OUTPUT, width = 32)
+    val data = UInt(OUTPUT, width = 32)
+    val we = Bool(OUTPUT)
+    val re = Bool(OUTPUT)
+    val ba = Bool(OUTPUT)
+  }
+  val res = new Bundle {
+    val stall = Bool(INPUT)
+    val data = UInt(INPUT, width = 32)
+  }
+}
+
+class SystemBus {
+  val int_go = Bool(INPUT)
+  val int_cause = UInt(INPUT, width = 32)
+  val eoi = Bool(OUTPUT)
+  val eoi_id = UInt(OUTPUT, width = 32)
+  val vmm_en = Bool(OUTPUT)
+  val vmm_pd = UInt(OUTPUT, width = 32)
+  val cai = Bool(OUTPUT)
+}
 
 class CPU extends Module {
 
-  val io = new Bundle {
+  val op_alu = UInt(0)
+  val op_ldl = UInt(2)
+  val op_ldh = UInt(3)
+  val op_jl = UInt(4)
+  val op_jr = UInt(5)
+  val op_ld = UInt(6)
+  val op_ldb = UInt(7)
+  val op_st = UInt(8)
+  val op_stb = UInt(9)
+  val op_sysenter = UInt(12)
+  val op_sysexit = UInt(13)
+  val op_bne = UInt(14)
+  val op_beq = UInt(15)
 
+  val io = new Bundle {
+    val bus = new SystemBus
+    val ic = new ICacheCmd
+    val dc = new DCacheCmd
+    val alu = ALUIO().flip // FIXME: io.alu.stall
   }
 
   val f = Reg(new Bundle {
@@ -50,136 +102,133 @@ class CPU extends Module {
     val reg_mem = Bool()
   })
 
+  val w = Reg(new Bundle {
+    val regfile = Vec.fill(32) { UInt(width = 32) }
+  })
+
   val flag = Reg(new Bundle {
     val int_en = Bool()
     val int_pc = UInt(width = 32)
     val int_cause = UInt(width = 32)
-    val int_handler = Uint(width = 32)
+    val int_hp = UInt(width = 32)
     val vmm_en = Bool()
-    val vmm_pd = Bool()
+    val vmm_pd = UInt(width = 32)
     val eoi = Bool()
   })
 
 
   def hazard_unit {
-    val op = io.i_data(31, 28)
-    val reg_x = io.i_data(27, 23)
-    val reg_a = io.i_data(22, 18)
-    val reg_b = Mux(op === op_alu, io.i_data(17, 13), UInt(0))
+    val op = io.ic.res.data(31, 28)
+    val reg_x = io.ic.res.data(27, 23)
+    val reg_a = io.ic.res.data(22, 18)
+    val reg_b = io.ic.res.data(17, 13)
+
+    def dest_match (dest: UInt) =
+      MuxCase(Bool(false), Seq(
+        Vec(op_alu).contains(op) ->
+          (dest === reg_a || dest === reg_b),
+        Vec(op_st, op_stb, op_bne, op_beq).contains(op) ->
+          (dest === reg_x || dest === reg_a),
+        Vec(op_jr, op_ldh, op_ld, op_ldb).contains(op) ->
+          (dest === reg_a)))
 
     stall := Bool(false)
 
     // load hazard
-    when (op === op_st || op === op_stb) {
-      when (d.mem_read && d.reg_dest && (d.reg_dest === reg_x || d.reg_dest === reg_a)) {
-        stall := Bool(true)
-      }
-    } .otherwise {
-      when (d.mem_read && d.reg_dest && (d.reg_dest === reg_a || d.reg_dest === reg_b)) {
-        stall := Bool(true)
-      }
+    when (d.mem_read && orR(d.reg_dest)) {
+      stall := stall || dest_match(d.reg_dest)
     }
 
-    // branch hazard
-    switch (op) {
-      is(op_bne, op_beq) {
-        when (d.alu_write && d.reg_dest && (d.reg_dest === reg_x || d.reg_dest === reg_a)) {
-          stall := Bool(true)
-        }
-        when (d.misc_write && d.reg_dest && (d.reg_dest === reg_x || d.reg_dest === reg_a)) {
-          stall := Bool(true)
-        }
-
-        when (e.mem_read && e.misc_dest && (e.misc_dest === reg_x || e.misc_dest === reg_a)) {
-          stall := Bool(true)
-        }
-      }
-      is(op_jr) {
-        when (d.alu_write && d.reg_dest && d.reg_dest === reg_a) {
-          stall := Bool(true)
-        }
-        when (d.misc_write && d.reg_dest && d.reg_dest === reg_a) {
-          stall := Bool(true)
-        }
-
-        when (e.mem_read && e.misc_dest && e.misc_dest === reg_a) {
-          stall := Bool(true)
-        }
-      }
-      is(op_sysenter, op_sysexit) {
-        when (d.mem_write || d.mem_read) {
-          stall := Bool(true)
-        }
-      }
+    // data hazard in branch unit
+    when ((d.alu_write || d.misc_write) && orR(d.reg_dest)) {
+      stall := stall || dest_match(d.reg_dest)
+    }
+    when (e.mem_read && orR(e.misc_dest)) {
+      stall := stall || dest_match(e.misc_dest)
     }
 
     // trap hazard
-    when (io.int_go) {
-      when (d.mem_write || d.mem_read) {
-        stall := Bool(true)
-      }
+    when (io.bus.int_go || Vec(op_sysenter, op_sysexit).contains(op)) {
+      stall := stall || (d.mem_read || d.mem_write)
     }
   }
 
-  def detect_branch (rf: Vec, int_hdr: UInt, int_pc: UInt, pc_src: Bool, pc_addr: UInt) {
-    val op = io.i_data(31, 28)
-    val reg_x = io.i_data(27, 23)
-    val reg_a = io.i_data(22, 18)
+  def forward_unit {
 
-    def forward (reg: UInt, data: UInt) {
-      // perform forwarding, but results may be wrong...
-      when (e.misc_write && e.misc_dest && e.misc_dest === reg) {
-        data := e.misc_res
-      } .elsewhen (e.alu_write && e.alu_dest && e.alu_dest === reg) {
-        data := io.alu_res
-      } .otherwise {
-        data := rf(reg)
-      }
+    for (i <- 1 to 31) {
+      fw.regfile(UInt(i)) := Mux(m.reg_write && m.reg_dest === UInt(i),
+        Mux(m.reg_mem, io.dc.res.data, m.res), w.regfile(UInt(i)))
     }
 
-    forward(reg_x, data_x)
-    forward(reg_a, data_a)
+    def ex_forward (reg_src: UInt, reg_data: UInt) =
+      MuxCase(reg_data, Seq(
+        (e.misc_write && orR(e.misc_dest) && e.misc_dest === reg_src) ->
+          e.misc_res,
+        (e.alu_write && orR(e.alu_dest) && e.alu_dest === reg_src) ->
+          io.alu.r,
+        (m.reg_write && orR(m.reg_dest) && m.reg_dest === reg_src) ->
+          Mux(m.reg_mem, io.dc.res.data, m.res)))
 
-    switch (op) {
-      is (op_jl, op_bne, op_beq) {
-        pc_addr := f.nextpc + (io.i_data(15, 0) << 2)
-      }
-      is (op_jr) {
-        pc_addr := data_a
-      }
-      is (op_sysenter) {
-        pc_addr := int_hdr
-      }
-      is (op_sysexit) {
-        pc_addr := int_pc
-      }
-    }
+    def id_forward (reg_src: UInt) =
+      MuxCase(fw.regfile(reg_src), Seq(
+        (e.misc_write && orR(e.misc_dest) && e.misc_dest === reg_src) ->
+          e.misc_res,
+        (e.alu_write && orR(e.alu_dest) && e.alu_dest === reg_src) ->
+          io.alu.r))
 
-    pc_src := UInt(0)
+    fw.ex_data_x := ex_forward(d.reg_dest, d.data_x)
+    fw.ex_data_a := ex_forward(d.reg_a, d.data_a)
+    fw.ex_data_b := ex_forward(d.reg_b, d.data_b)
 
-    switch (op) {
-      is (op_jl, op_jr, op_sysenter, op_sysexit) {
-        pc_src := Bool(true)
-      }
-      is (op_bne) {
-        pc_src := data_x != data_a
-      }
-      is (op_beq) {
-        pc_src := data_x === data_a
-      }
-    }
+    fw.id_data_x := id_forward(io.ic.res.data(27, 23))
+    fw.id_data_a := id_forward(io.ic.res.data(22, 18))
+    fw.id_data_b := id_forward(io.ic.res.data(17, 13))
+
+    val e_data = e.misc_res
+
+    fw.int_en := Mux(! (e.mem_write && e.mem_addr === UInt("h80001104")),
+      flag.int_en, e_data(0))
+    fw.int_pc := Mux(! (e.mem_write && e.mem_addr === UInt("h80001108")),
+      flag.int_pc, e_data)
+    fw.int_hp := Mux(! (e.mem_write && e.mem_addr === UInt("h80001100")),
+      flag.int_hp, e_data)
   }
 
-  def trap_unit (int_en: Bool) {
-    val op = io.i_data(31, 28)
+  def detect_branch {
+    val op = io.ic.res.data(31, 28)
+
+    val data_a = fw.id_data_a
+    val data_x = fw.id_data_x
+
+    d.pc_addr := PriorityMux(Seq(
+      (op === op_jr) ->
+        data_a,
+      (op === op_sysenter) ->
+        fw.int_hp,
+      (op === op_sysexit) ->
+        fw.int_pc,
+      Vec(op_jl, op_bne, op_beq).contains(op) ->
+        (f.nextpc + (io.ic.res.data(15, 0) << 2))))
+
+    d.pc_src := MuxCase(Bool(false), Seq(
+      Vec(op_jl, op_jr, op_sysenter, op_sysexit).contains(op) ->
+        Bool(true),
+      Vec(op_beq).contains(op) ->
+        (data_x === data_a),
+      Vec(op_bne).contains(op) ->
+        (data_x != data_a)))
+  }
+
+  def trap_unit {
+    val op = io.ic.res.data(31, 28)
 
     flag.eoi := Bool(false)
 
-    unless (io.d_stall || flag.eoi || stall || d.pc_src) {
-      val nexteoi = (! flag.eoi && int_en && io.int_go)
+    unless (io.dc.res.stall || flag.eoi || stall || d.pc_src) {
+      val nexteoi = (! flag.eoi && fw.int_en && io.bus.int_go)
 
       when (nexteoi) {
-        flag.int_cause := io.int_cause
+        flag.int_cause := io.bus.int_cause
         flag.int_pc := f.nextpc
         flag.int_en := Bool(false)
       } .elsewhen (op === op_sysenter) {
@@ -198,7 +247,7 @@ class CPU extends Module {
     when (m.reg_write) {
       for (i <- 1 to 31) {
         when (m.reg_dest === UInt(i)) {
-          regfile(UInt(i)) := Mux(m.reg_mem, io.d_data, m.res)
+          w.regfile(UInt(i)) := Mux(m.reg_mem, io.dc.res.data, m.res)
         }
       }
     }
@@ -209,27 +258,17 @@ class CPU extends Module {
     val data = e.misc_res
     val we = e.mem_write
     val re = e.mem_read
+    val ba = e.mem_byte
 
     m.reg_write := e.alu_write || e.misc_write
-
-    when (e.alu_write) {
-      m.res := io.alu_res
-      m.reg_dest := e.alu_dest
-    } .elsewhen (e.misc_write) {
-      m.res := e.misc_res
-      m.reg_dest := e.misc_dest
-    }
-
-    when (UInt("h80001100") <= addr && addr <= UInt("h80002000")) {
-      m.reg_mem := Bool(false)
-    } .otherwise {
-      m.reg_mem := e.mem_read
-    }
+    m.reg_dest := Mux(e.alu_write, e.alu_dest, e.misc_dest)
+    m.reg_mem := e.mem_read && ! (UInt("h80001100") <= addr && addr <= UInt("h80002000"))
+    m.res := Mux(e.alu_write, io.alu.r, e.misc_res)
 
     when (re) {
       switch (addr) {
         is(UInt("h80001100")) {
-          m.res := flag.int_handler
+          m.res := flag.int_hp
         }
         is(UInt("h80001104")) {
           m.res := flag.int_en
@@ -252,7 +291,7 @@ class CPU extends Module {
     when (we) {
       switch (addr) {
         is(UInt("h80001100")) {
-          flag.int_handler := data
+          flag.int_hp := data
         }
         is(UInt("h80001104")) {
           flag.int_en := data(0)
@@ -272,32 +311,28 @@ class CPU extends Module {
       }
     }
 
-    cai := (addr === UInt("h80001200") || addr == UInt("h80001204")) && we
-
-    when (io.d_stall) {
+    when (io.dc.res.stall) {
       m.reg_write := Bool(false)
     }
+
+    io.dc.req.addr := addr
+    io.dc.req.data := data
+    io.dc.req.we := we
+    io.dc.req.re := re
+    io.dc.req.ba := ba
+    io.bus.vmm_en := flag.vmm_en
+    io.bus.vmm_pd := flag.vmm_pd
+    io.bus.eoi := flag.eoi
+    io.bus.eoi_id := flag.int_cause
+    io.bus.cai := (addr === UInt("h80001200") || addr === UInt("h80001204")) && we
   }
 
   def execute_unit {
+    val data_a = fw.ex_data_a
+    val data_b = fw.ex_data_b
+    val data_x = fw.ex_data_x
 
-    def data_forward (reg_src: UInt, reg_data: UInt, res: UInt) {
-      when (e.misc_write && e.misc_dest && e.misc_dest === reg_src) {
-        res := e.misc_res
-      } .elsewhen (e.alu_write && e.alu_dest && e.alu_dest === reg_src) {
-        res := io.alu_res
-      } .elsewhen (m.reg_write && m.reg_dest && m.reg_dest === reg_src) {
-        res := Mux(m.reg_mem, io.d_data, m.res)
-      } .otherwise {
-        res := reg_data
-      }
-    }
-
-    data_forward(d.reg_a, d.data_a, data_a)
-    data_forward(d.reg_b, d.data_b, data_b)
-    data_forward(d.reg_dest, d.data_x, data_x)
-
-    unless (io.d_stall) {
+    unless (io.dc.res.stall) {
       e.mem_addr := Mux(d.mem_byte, data_a + d.data_d, data_a + (d.data_d << 2))
       e.mem_write := d.mem_write
       e.mem_read := d.mem_read
@@ -305,53 +340,59 @@ class CPU extends Module {
 
       // alu
       e.alu_write := d.alu_write
-      e.alu_dest := d.alu_dest
+      e.alu_dest := d.reg_dest
 
       // misc
-      switch (d.opcode) {
-        is(op_ldl) {
-          e.misc_res := d.data_d
-        }
-        is(op_ldh) {
-          e.misc_res := Cat(d.data_d(15, 0), data_a(15, 0))
-        }
-        is(op_jl, op_jr) {
-          e.misc_res := d.nextpc
-        }
-        is(op_st, op_stb) {
-          e.misc_res := data_x
-        }
-      }
       e.misc_write := d.misc_write
       e.misc_dest := d.reg_dest
+
+      e.misc_res := PriorityMux(Seq(
+        Vec(op_ldl).contains(d.opcode) ->
+          d.data_d,
+        Vec(op_ldh).contains(d.opcode) ->
+          Cat(d.data_d(15, 0), data_a(15, 0)),
+        Vec(op_jl, op_jr).contains(d.opcode) ->
+          d.nextpc,
+        Vec(op_st, op_stb).contains(d.opcode) ->
+          data_x))
     }
 
-    when (! io.d_stall && flag.eoi) { // flush operation if it came from *previous* ID
+    when (! io.dc.res.stall && flag.eoi) { // flush operation if it came from *previous* ID
       e.alu_write := Bool(false)
       e.misc_write := Bool(false)
       e.mem_write := Bool(false)
       e.mem_read := Bool(false)
     }
+
+    io.alu.optag := d.tag
+    io.alu.a := data_a
+    io.alu.b := data_b
+    io.alu.l := d.data_l
   }
 
   def decode_unit {
     // val inst = UInt(0, width = 32)
 
     // // TODO: this circuit should be moved to icache
-    // unless (io.i_stall) {
-    //   inst := Mux(f.inst_src, f.inst, io.i_data)
+    // unless (io.ic.res.stall) {
+    //   inst := Mux(f.inst_src, f.inst, io.ic.res.data)
     // }
 
-    val op = io.i_data(31, 28)
+    val op = io.ic.res.data(31, 28)
 
-    unless (io.d_stall) {
+    // update even when io.dc.res.stall is active
+    d.data_x := fw.id_data_x;
+    d.data_a := fw.id_data_a;
+    d.data_b := fw.id_data_b;
+
+    unless (io.dc.res.stall) {
       d.opcode := op
-      d.reg_dest := io.i_data(27, 23)
-      d.reg_a := io.i_data(22, 18)
-      d.reg_b := io.i_data(17, 13)
-      d.data_l := io.i_data(12, 5)
-      d.data_d := io.i_data(15, 0)
-      d.tag := io.i_data(4, 0)
+      d.reg_dest := io.ic.res.data(27, 23)
+      d.reg_a := io.ic.res.data(22, 18)
+      d.reg_b := io.ic.res.data(17, 13)
+      d.data_l := io.ic.res.data(12, 5)
+      d.data_d := io.ic.res.data(15, 0)
+      d.tag := io.ic.res.data(4, 0)
 
       d.nextpc := f.nextpc
       d.alu_write := op === op_alu
@@ -363,48 +404,60 @@ class CPU extends Module {
       detect_branch
     }
 
-    when ((! io.d_stall && (stall || d.pc_src)) || flag.eoi) {
+    when ((! io.dc.res.stall && (stall || d.pc_src)) || flag.eoi) {
       d.alu_write := Bool(false)
       d.misc_write := Bool(false)
       d.mem_write := Bool(false)
       d.mem_read := Bool(false)
       d.pc_src := Bool(false)
     }
-
-    d.data_x := ;
-    d.data_a := ;
-    d.data_b := ;
   }
 
   def fetch_unit {
-    val pc = UInt(0, width = 32)
 
-    when (eoi) {
-      pc := flag.int_handler
-    } .elsewhen (d.pc_src) {
-      pc := d.pc_addr
-    } .otherwise {
-      pc := f.nextpc
-    }
+    val pc = MuxCase(f.nextpc, Seq(
+      flag.eoi ->
+        flag.int_hp,
+      d.pc_src ->
+        d.pc_addr))
 
-    unless (stall || io.d_stall || io.i_stall) {
+    unless (stall || io.dc.res.stall || io.ic.res.stall) {
       f.nextpc := pc + UInt(4)
     }
 
+    io.ic.req.addr := pc
+
     // // TODO: this circuit should be moved to icache
-    // f.inst_src := (! eoi && ! d.pc_src && (stall || io.d_stall) && ! io.i_stall)
+    // f.inst_src := (! eoi && ! d.pc_src && (stall || io.dc.res.stall) && ! io.ic.res.stall)
     // f.inst := inst
   }
 
   val stall = Bool(false)
 
-  hazard_unit
+  val pc = UInt(0, width = 32)
+
+  val fw = new Bundle {
+    val ex_data_x = UInt(0, width = 32)
+    val ex_data_a = UInt(0, width = 32)
+    val ex_data_b = UInt(0, width = 32)
+    val id_data_x = UInt(0, width = 32)
+    val id_data_a = UInt(0, width = 32)
+    val id_data_b = UInt(0, width = 32)
+    val int_en = Bool(false)
+    val int_pc = UInt(0, width = 32)
+    val int_hp = UInt(0, width = 32)
+    val regfile = Vec.fill(32) { UInt(0, width = 32) }
+  }
 
   write_unit
 
   memory_unit
 
+  forward_unit
+
   execute_unit
+
+  hazard_unit
 
   decode_unit
 
