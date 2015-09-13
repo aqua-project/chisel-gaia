@@ -104,7 +104,7 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
       when (io.cmdin.valid) {
         val varIndex = io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,wordsWidth);
         val varTag = io.cmdin.bits.addr.apply(20,indexWidth + wordsWidth);
-        val nowWay = Mux(varTag === tagArray((varIndex << wayBits) +p UInt(0)),UInt (0),
+        val nowWay = Mux(varTag === tagArray((varIndex << wayBits) + UInt(0)),UInt (0),
           Mux (varTag === tagArray((varIndex << wayBits) + UInt(1)),UInt (1),UInt(2)))
 //        val nowWay = hitWay (varTag,varIndex);
         // for (i <- 0 to numOfWay - 1) {
