@@ -156,7 +156,7 @@ class CPU extends Module {
   def forward_unit {
 
     for (i <- 1 to 31) {
-      fw.regfile(UInt(i)) := Mux(m.reg_write && m.reg_dest === UInt(i),
+      fw.regfile(i) := Mux(m.reg_write && m.reg_dest === UInt(i),
         Mux(m.reg_mem, io.dc.res.data, m.res), w.regfile(UInt(i)))
     }
 
@@ -247,7 +247,7 @@ class CPU extends Module {
     when (m.reg_write) {
       for (i <- 1 to 31) {
         when (m.reg_dest === UInt(i)) {
-          w.regfile(UInt(i)) := Mux(m.reg_mem, io.dc.res.data, m.res)
+          w.regfile(i) := Mux(m.reg_mem, io.dc.res.data, m.res)
         }
       }
     }
