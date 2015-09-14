@@ -103,7 +103,7 @@ class CPU extends Module {
   })
 
   val w = Reg(new Bundle {
-    val regfile = Vec.fill(32) { UInt(width = 32) }
+    val regfile = Vec(UInt(width = 32), 32)
   })
 
   val flag = Reg(new Bundle {
@@ -432,11 +432,12 @@ class CPU extends Module {
     // f.inst := inst
   }
 
-  val stall = Bool(false)
 
-  val pc = UInt(0, width = 32)
+  val stall = Wire(Bool())
 
-  val fw = new Bundle {
+  val pc = Wire(UInt(width = 32))
+
+  val fw = Wire(Some(new Bundle {
     val ex_data_x = UInt(width = 32)
     val ex_data_a = UInt(width = 32)
     val ex_data_b = UInt(width = 32)
@@ -447,7 +448,7 @@ class CPU extends Module {
     val int_pc = UInt(width = 32)
     val int_hp = UInt(width = 32)
     val regfile = Vec(UInt(width = 32), 32)
-  }
+  }))
 
   write_unit
 
