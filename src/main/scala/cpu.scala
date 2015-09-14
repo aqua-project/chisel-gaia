@@ -437,16 +437,16 @@ class CPU extends Module {
   val pc = UInt(0, width = 32)
 
   val fw = new Bundle {
-    val ex_data_x = UInt(0, width = 32)
-    val ex_data_a = UInt(0, width = 32)
-    val ex_data_b = UInt(0, width = 32)
-    val id_data_x = UInt(0, width = 32)
-    val id_data_a = UInt(0, width = 32)
-    val id_data_b = UInt(0, width = 32)
-    val int_en = Bool(false)
-    val int_pc = UInt(0, width = 32)
-    val int_hp = UInt(0, width = 32)
-    val regfile = Vec.fill(32) { UInt(0, width = 32) }
+    val ex_data_x = UInt(width = 32)
+    val ex_data_a = UInt(width = 32)
+    val ex_data_b = UInt(width = 32)
+    val id_data_x = UInt(width = 32)
+    val id_data_a = UInt(width = 32)
+    val id_data_b = UInt(width = 32)
+    val int_en = Bool()
+    val int_pc = UInt(width = 32)
+    val int_hp = UInt(width = 32)
+    val regfile = Vec(UInt(width = 32), 32)
   }
 
   write_unit
