@@ -25,7 +25,7 @@ class DCacheCmd extends Bundle {
   }
 }
 
-class SystemBus {
+class SystemBus extends Bundle {
   val int_go = Bool(INPUT)
   val int_cause = UInt(INPUT, width = 32)
   val eoi = Bool(OUTPUT)
