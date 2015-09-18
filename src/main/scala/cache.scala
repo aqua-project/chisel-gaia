@@ -19,11 +19,6 @@ import Chisel._
  */
 class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
   val io = new Bundle {
-    val pohe = UInt (OUTPUT);
-    val hyoe = UInt (OUTPUT);
-    val d_wdata_from_core = UInt (OUTPUT);
-    val foo = UInt (OUTPUT);
-    val bar = UInt (OUTPUT);
     val cmdin = Decoupled (new Bundle {
       val we = Bool (INPUT);
       val addr = UInt (width = 21);
@@ -67,7 +62,6 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
   val we      = Reg (init = Bool(false))
 
   val wdata_from_core = Reg (init = UInt (0,32));
-  io.d_wdata_from_core := wdata_from_core;
 
   val dram_buff = Reg (init = Decoupled(UInt(width = 16)));
 
@@ -78,26 +72,6 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
   io.cmdout.bits.we := we;
   io.rdataFromCore := core_buff;
   io.wdataToDRAM := dram_buff;
-
-  val pohe = Reg (init = UInt(0));
-  val hyoe = Reg (init = UInt(0));
-  val foo = Reg (init = UInt(0));
-  val bar = Reg (init = UInt(0));
-
-
-  io.pohe := pohe;
-  io.hyoe := hyoe;
-  io.foo := foo;
-  io.bar := bar;
-
-  def hitWay (varTag : UInt, varIndex : UInt) : UInt = {
-    for (i <- 0 until numOfWay ) {
-      when (varTag === tagArray ((varIndex << wayBits) + UInt(i))) {
-        return UInt(i);
-      }
-    }
-    return UInt (numOfWay);
-  }
 
   switch (state) {
     is (ready) {
@@ -119,11 +93,6 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
         // } .otherwise {
         //     nowWay = UInt(2);
         // }
-
-        pohe := nowWay;
-        hyoe := varTag;
-        foo  := tagArray((varIndex << wayBits) + UInt(0));
-        bar  := tagArray((varIndex << wayBits) + UInt(1));
 
         when (nowWay != UInt(numOfWay)) {
           val tmp_posInLine = io.cmdin.bits.addr.apply (wordsWidth - 1,0)
@@ -236,7 +205,6 @@ object Cache {
       poke (c.io.cmdin.bits.addr,addr);
       poke (c.io.cmdin.valid,true);
       step (1);
-      pohe ()
       if (!expectMiss) {
         expect (c.io.cmdin.ready,1)
         expect (c.io.rdataFromCore.valid,1)
@@ -277,7 +245,6 @@ object Cache {
       poke (c.io.wdataFromCore.bits,value)
 
       step (1);
-      pohe ()
       if (!expectMiss) {
         expect (c.io.cmdin.ready,1)
         print ("end of write test\n");
@@ -313,16 +280,6 @@ object Cache {
     writeTest (2048,123456789,true);
     readTest  (2048,123456789,false);
     readTest  (1024,234567890,false);
-    def pohe () {
-      printf ("pohe:%d\n",peek (c.io.pohe));
-      peek (c.io.hyoe);
-      peek (c.io.foo);
-      peek (c.io.bar);
-      if (peek (c.io.pohe) == 0) {
-        print("POHE!\n");
-      } else {
-        print("HYOE\n");
-      }
-    }
+
   }
 }
