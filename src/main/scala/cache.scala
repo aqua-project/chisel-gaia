@@ -78,25 +78,15 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
       when (io.cmdin.valid) {
         val varIndex = io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,wordsWidth);
         val varTag = io.cmdin.bits.addr.apply(20,indexWidth + wordsWidth);
-        val nowWay = Mux(varTag === tagArray((varIndex << wayBits) + UInt(0)),UInt (0),
-          Mux (varTag === tagArray((varIndex << wayBits) + UInt(1)),UInt (1),UInt(2)))
-//        val nowWay = hitWay (varTag,varIndex);
-        // for (i <- 0 to numOfWay - 1) {
-        //     when (varTag === tagArray ((varIndex << wayBits) + UInt(i))) {
-        //       nowWay = i
-        //     }
-        // }
-        // when (varTag === tagArray((varIndex << wayBits) + UInt(0))) {
-        //   nowWay = UInt(0);
-        // } .elsewhen (varTag === tagArray((varIndex << wayBits) + UInt(1))) {
-        //     nowWay = UInt(1);
-        // } .otherwise {
-        //     nowWay = UInt(2);
-        // }
+        val nowWay = MuxCase (UInt (numOfWay),Array (
+          (varTag === tagArray((varIndex << wayBits) + UInt(0))) -> UInt (0),
+          (varTag === tagArray((varIndex << wayBits) + UInt(1))) -> UInt (1)));
 
         when (nowWay != UInt(numOfWay)) {
+          // cache hit
           val tmp_posInLine = io.cmdin.bits.addr.apply (wordsWidth - 1,0)
           dram_buff.valid := Bool (false)
+          nextWay (index) := UInt (1) - nowWay;
           when (io.cmdin.bits.we) {
             // write
             when (io.wdataFromCore.valid) {
@@ -108,6 +98,7 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
             core_buff.valid := Bool(true)
           }
         } .otherwise {
+          // cache miss
           core_buff.valid := Bool (false)
           state := busy
           count := time
@@ -157,11 +148,8 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           state := ready
           wordCnt := UInt(0)
           tagArray ((index << wayBits) + nextWay (index)) := tag
-          when (nextWay (index) === UInt(numOfWay - 1)) {
-            nextWay (index) := UInt (0)
-          }.otherwise {
-            nextWay (index) := nextWay (index) + UInt (1);
-          }
+
+          nextWay (index) := UInt (1) - nextWay (index);
         } .otherwise {
           wordCnt := wordCnt + UInt (1);
         }
