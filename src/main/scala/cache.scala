@@ -10,7 +10,6 @@ import Chisel._
  * length of DRAM Addr : 22 bit
  * length of CPU Addr : 21 bit
  * NOW, DO NOT CARE ready bit of DRAM !! wtime must be correct.
- * write addr is not correct
 
  Arguments
 =================
@@ -51,12 +50,17 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
 
   val cacheSize = numOfLine * numOfWay;
 
+  // cache line is dirty or clean
+  val clean :: dirty :: lineStates = Enum (UInt(),2)
+
   val cache = Mem(UInt(width = 32), cacheSize * wordsPerLine);
+  val lineStateArray = Mem(UInt(width = 2), cacheSize);
   val tagArray = Mem(UInt (width = tagWidth), cacheSize);
   val nextWay = Mem(UInt(width = log2Up (numOfWay) + 1), numOfLine);
 
   val busy :: ready :: cacheStates = Enum (UInt(),2)
   val readMode :: writeMode :: readWriteMode = Enum (UInt(),2)
+
   val state   = Reg (init = ready)
   val count   = Reg (init = time)
   val wordCnt = Reg (init = UInt(0,3))
@@ -89,11 +93,12 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           // cache hit
           val tmp_posInLine = io.cmdin.bits.addr.apply (wordsWidth - 1,0)
           dram_buff.valid := Bool (false)
-          nextWay (index) := UInt (1) - nowWay;
+          nextWay (varIndex) := UInt (1) - nowWay;
           when (io.cmdin.bits.we) {
             // write
             when (io.wdataFromCore.valid) {
               cache (Cat(varIndex,nowWay,tmp_posInLine)) := io.wdataFromCore.bits
+              lineStateArray (varIndex ## nowWay) := dirty;
             }
           } .otherwise {
             // read
@@ -110,11 +115,23 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           // burst access
           when (io.cmdin.bits.we) {
             // tag index words
-            val tmp_index = io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,wordsWidth)
-            // addr for write back
-            addr := tagArray (Cat(tmp_index,nextWay (tmp_index),io.cmdin.bits.addr(indexWidth + wordsWidth - 1,0),UInt (0)))
+
+            wdata_from_core := io.wdataFromCore.bits;
+            when (lineStateArray (varIndex ## nextWay (varIndex)) === dirty) {
+              dram_buff.bits := cache (Cat(varIndex,nextWay (varIndex),UInt(0,lineBits + 1)))
+              dram_buff.valid := Bool(true)
+              // write back
+              mode      := writeMode;
+              // addr for write back
+              addr := tagArray (Cat(varIndex,nextWay (varIndex))) ## io.cmdin.bits.addr(indexWidth + wordsWidth - 1,0) ## UInt (0)
+            } .otherwise {
+              // TODO: skip write back
+              mode      := readMode;
+              addr := io.cmdin.bits.addr ## UInt (0)
+            }
           }.otherwise {
             addr := io.cmdin.bits.addr ## UInt (0)
+            mode      := readMode;
           }
           we   := io.cmdin.bits.we
 
@@ -122,15 +139,6 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           index      := io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,wordsWidth);
           posInLine := io.cmdin.bits.addr.apply (wordsWidth - 1,0)
 
-          when (io.cmdin.bits.we) {
-            dram_buff.bits := cache (Cat(varIndex,nextWay (index),UInt(0,lineBits + 1)))
-            dram_buff.valid := Bool(true)
-            wdata_from_core := io.wdataFromCore.bits;
-            // write back
-            mode      := writeMode;
-          } .otherwise {
-            mode      := readMode;
-          }
         }
       }
     }
@@ -139,9 +147,9 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
         count := time
         when (mode === readMode && io.rdataToDRAM.valid) {
           when (wordCnt (0) === UInt (0)) {
-            cache (Cat (index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)).apply(15,0) := io.rdataToDRAM.bits
+            cache (Cat (index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)) := io.rdataToDRAM.bits 
           }.otherwise {
-            cache (Cat (index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)).apply(31,16) := io.rdataToDRAM.bits
+            cache (Cat (index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)) := io.rdataToDRAM.bits ## cache (Cat (index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)).apply (15,0)
           }
         }
 
@@ -152,20 +160,23 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
               cache (Cat (index,nextWay (index),posInLine)) := wdata_from_core
               nextWay (index) := UInt (1) - nextWay (index);
               state := ready
+              lineStateArray (index ## nextWay (index)) := dirty;
             }.otherwise {
               // end of write back
               mode := readMode
-              addr := Cat (tag,index,posInLine);
+              addr := Cat (tag,index,posInLine) ## UInt (0);
             }
           } .otherwise {
             core_buff.bits := cache (Cat(index,nextWay (index),posInLine));
             core_buff.valid := Bool(true)
             state := ready
             nextWay (index) := UInt (1) - nextWay (index);
+            lineStateArray (index ## nextWay (index)) := clean;
           }
 
           wordCnt := UInt(0)
           tagArray (index ## nextWay (index)) := tag
+
         } .otherwise {
           wordCnt := wordCnt + UInt (1);
         }
@@ -227,22 +238,23 @@ object Cache {
     def readRoutine (addr: Int,value: Int) {
       expect (c.io.cmdout.valid,1);
       expect (c.io.cmdout.bits.we,0);
-      expect (c.io.cmdout.bits.addr,addr);
+      expect (c.io.cmdout.bits.addr,addr << 1);
       for (i <- 0 to 3) {
         // TODO: In this test,timing is critical
         // low bit
-        step (wtime)
+        step (wtime-1)
         poke (c.io.rdataToDRAM.bits,value & ((1 << 16) - 1));
         poke (c.io.rdataToDRAM.valid,true);
-
+        step (1)
         // high bit
-        step (wtime);
+        step (wtime-1);
         poke (c.io.rdataToDRAM.valid,true);
         poke (c.io.rdataToDRAM.bits,value >> 16);
+        step (1)
       }
     }
 
-    def writeTest (addr: Int,value: Int,expectMiss: Boolean) {
+    def writeTest (addr: Int,value: Int,expectMiss: Boolean,expectWriteBack: Boolean) {
       print ("start of write test\n");
       while (peek (c.io.cmdin.ready) == 0) {
         step (1);
@@ -252,31 +264,34 @@ object Cache {
       poke (c.io.cmdin.valid,true);
       poke (c.io.wdataFromCore.valid,true)
       poke (c.io.wdataFromCore.bits,value)
-
       step (1);
       if (!expectMiss) {
         expect (c.io.cmdin.ready,1)
         print ("end of write test\n");
         return
       }
-      print ("start of write back\n");
-      expect (c.io.cmdout.valid,1);
-      expect (c.io.cmdout.bits.we,1);
-      printf ("cmdout addr:%d\n",peek (c.io.cmdout.bits.addr));
+      if (expectWriteBack) {
+        print ("start of write back\n");
+        expect (c.io.cmdout.valid,1);
+        expect (c.io.cmdout.bits.we,1);
+        printf ("cmdout addr:%d\n",peek (c.io.cmdout.bits.addr));
 
-      for (i <- 0 to 3) {
-        // low bit
-        printf ("wdata to DRAM:%d\n",peek(c.io.wdataToDRAM.bits));
+        for (i <- 0 to 3) {
+          // low bit
+          printf ("wdata to DRAM:%d\n",peek(c.io.wdataToDRAM.bits));
 
-        expect (c.io.wdataToDRAM.valid,1);
-        step (wtime)
+          expect (c.io.wdataToDRAM.valid,1);
+          step (wtime)
 
-        // high bit
-        printf ("wdata to DRAM:%d\n",peek(c.io.wdataToDRAM.bits));
-        expect (c.io.wdataToDRAM.valid,1);
-        step (wtime);
+          // high bit
+          printf ("wdata to DRAM:%d\n",peek(c.io.wdataToDRAM.bits));
+          expect (c.io.wdataToDRAM.valid,1);
+          step (wtime);
+        }
+        print ("end of write back\n");
+      } else {
+        print ("write back is skipped\n");
       }
-      print ("end of write back\n");
       print ("start of read for write\n");
       // data from dram is always 0 in test
       readRoutine (addr,0);
@@ -285,15 +300,23 @@ object Cache {
     }
 
     // expect 1024 and 1025 are in the same line
-    writeTest (1024,1234567890,true);
+    writeTest (1024,1234567890,true,false);
     readTest  (1024,1234567890,false);
-    writeTest (1025,1234567890,false);
+    writeTest (1025,1234567890,false,false);
     readTest  (1025,1234567890,false);
 
     // expect working as 2 nowWay
-    writeTest (1024,234567890,false);
-    writeTest (2048,123456789,true);
+    writeTest (1024,234567890,false,false);
+    writeTest (2048,123456789,true,false);
     readTest  (2048,123456789,false);
     readTest  (1024,234567890,false);
+
+
+    // expect worinkg as 2 way LRU
+    print ("here\n")
+    writeTest (3072,3456789,true,true);
+    readTest  (1024,234567890,false);
+    readTest  (2048,123456789,true);
+
   }
 }
