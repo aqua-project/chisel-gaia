@@ -10,6 +10,7 @@ import Chisel._
  * length of DRAM Addr : 22 bit
  * length of CPU Addr : 21 bit
  * NOW, DO NOT CARE ready bit of DRAM !! wtime must be correct.
+ * write addr is not correct
 
  Arguments
 =================
@@ -55,11 +56,13 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
   val nextWay = Mem(UInt(width = log2Up (numOfWay) + 1), numOfLine);
 
   val busy :: ready :: cacheStates = Enum (UInt(),2)
+  val readMode :: writeMode :: readWriteMode = Enum (UInt(),2)
   val state   = Reg (init = ready)
   val count   = Reg (init = time)
   val wordCnt = Reg (init = UInt(0,3))
   val addr    = Reg (init = UInt(0,22));
-  val we      = Reg (init = Bool(false))
+  val we      = Reg (init = Bool(false));
+  val mode    = Reg (init = Bool (false));
 
   val wdata_from_core = Reg (init = UInt (0,32));
 
@@ -69,7 +72,7 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
 
   io.cmdout.valid := (state === busy);
   io.cmdout.bits.addr := addr;
-  io.cmdout.bits.we := we;
+  io.cmdout.bits.we := mode;
   io.rdataFromCore := core_buff;
   io.wdataToDRAM := dram_buff;
 
@@ -79,8 +82,8 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
         val varIndex = io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,wordsWidth);
         val varTag = io.cmdin.bits.addr.apply(20,indexWidth + wordsWidth);
         val nowWay = MuxCase (UInt (numOfWay),Array (
-          (varTag === tagArray((varIndex << wayBits) + UInt(0))) -> UInt (0),
-          (varTag === tagArray((varIndex << wayBits) + UInt(1))) -> UInt (1)));
+          (varTag === tagArray(Cat(varIndex,UInt(0)))) -> UInt (0),
+          (varTag === tagArray(Cat(varIndex,UInt(1)))) -> UInt (1)));
 
         when (nowWay != UInt(numOfWay)) {
           // cache hit
@@ -90,11 +93,11 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           when (io.cmdin.bits.we) {
             // write
             when (io.wdataFromCore.valid) {
-              cache ((varIndex << (wayBits + lineBits)) + (nowWay << lineBits) + tmp_posInLine) := io.wdataFromCore.bits
+              cache (Cat(varIndex,nowWay,tmp_posInLine)) := io.wdataFromCore.bits
             }
           } .otherwise {
             // read
-            core_buff.bits := cache ((varIndex << (wayBits + lineBits)) + (nowWay << lineBits) + tmp_posInLine)
+            core_buff.bits := cache (Cat(varIndex,nowWay,tmp_posInLine))
             core_buff.valid := Bool(true)
           }
         } .otherwise {
@@ -108,7 +111,8 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           when (io.cmdin.bits.we) {
             // tag index words
             val tmp_index = io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,wordsWidth)
-            addr := tagArray ((tmp_index << wayBits) + nextWay (tmp_index)) ## io.cmdin.bits.addr.apply(indexWidth + wordsWidth - 1,0) ## UInt (0)
+            // addr for write back
+            addr := tagArray (Cat(tmp_index,nextWay (tmp_index),io.cmdin.bits.addr(indexWidth + wordsWidth - 1,0),UInt (0)))
           }.otherwise {
             addr := io.cmdin.bits.addr ## UInt (0)
           }
@@ -119,9 +123,13 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           posInLine := io.cmdin.bits.addr.apply (wordsWidth - 1,0)
 
           when (io.cmdin.bits.we) {
-            dram_buff.bits := cache ((varIndex << (wayBits + lineBits)) + (nextWay (index) << lineBits) + UInt(0))
+            dram_buff.bits := cache (Cat(varIndex,nextWay (index),UInt(0,lineBits + 1)))
             dram_buff.valid := Bool(true)
             wdata_from_core := io.wdataFromCore.bits;
+            // write back
+            mode      := writeMode;
+          } .otherwise {
+            mode      := readMode;
           }
         }
       }
@@ -129,36 +137,44 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
     is (busy) {
       when (count === UInt (0)) {
         count := time
-        when (we === Bool(false) && io.rdataToDRAM.valid) {
+        when (mode === readMode && io.rdataToDRAM.valid) {
           when (wordCnt (0) === UInt (0)) {
-            cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + wordCnt (wordsWidth,1)).apply(15,0) := io.rdataToDRAM.bits
+            cache (Cat (index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)).apply(15,0) := io.rdataToDRAM.bits
           }.otherwise {
-            cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + wordCnt (wordsWidth,1)).apply(31,16) := io.rdataToDRAM.bits
+            cache (Cat (index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)).apply(31,16) := io.rdataToDRAM.bits
           }
         }
 
         // finish
         when (wordCnt === UInt(7)) {
           when (we) {
-            cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + posInLine) := wdata_from_core
-          }.otherwise {
-            core_buff.bits := cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + posInLine);
+            when (mode === readMode) {
+              cache (Cat (index,nextWay (index),posInLine)) := wdata_from_core
+              nextWay (index) := UInt (1) - nextWay (index);
+              state := ready
+            }.otherwise {
+              // end of write back
+              mode := readMode
+              addr := Cat (tag,index,posInLine);
+            }
+          } .otherwise {
+            core_buff.bits := cache (Cat(index,nextWay (index),posInLine));
             core_buff.valid := Bool(true)
+            state := ready
+            nextWay (index) := UInt (1) - nextWay (index);
           }
-          state := ready
-          wordCnt := UInt(0)
-          tagArray ((index << wayBits) + nextWay (index)) := tag
 
-          nextWay (index) := UInt (1) - nextWay (index);
+          wordCnt := UInt(0)
+          tagArray (index ## nextWay (index)) := tag
         } .otherwise {
           wordCnt := wordCnt + UInt (1);
         }
 
-        when (we) {
+        when (mode) {
           when (wordCnt (0) === UInt (0)) {
-            dram_buff.bits := cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + wordCnt (wordsWidth,1)).apply(15,0)
+            dram_buff.bits := cache (Cat(index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)).apply(15,0)
           }.otherwise {
-            dram_buff.bits := cache ((index << (wayBits + lineBits)) + (nextWay (index) << lineBits) + wordCnt (wordsWidth,1)).apply(31,16)
+            dram_buff.bits := cache (Cat(index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)).apply(31,16)
           }
           dram_buff.valid := Bool(true)
         }
@@ -200,6 +216,15 @@ object Cache {
         print ("end of read test\n");
         return
       }
+      readRoutine (addr,value)
+
+      expect (c.io.rdataFromCore.valid,1)
+      expect (c.io.rdataFromCore.bits,value)
+
+      print ("end of read test\n");
+    }
+
+    def readRoutine (addr: Int,value: Int) {
       expect (c.io.cmdout.valid,1);
       expect (c.io.cmdout.bits.we,0);
       expect (c.io.cmdout.bits.addr,addr);
@@ -215,10 +240,6 @@ object Cache {
         poke (c.io.rdataToDRAM.valid,true);
         poke (c.io.rdataToDRAM.bits,value >> 16);
       }
-
-      expect (c.io.rdataFromCore.valid,1)
-      expect (c.io.rdataFromCore.bits,value)
-      print ("end of read test\n");
     }
 
     def writeTest (addr: Int,value: Int,expectMiss: Boolean) {
@@ -238,6 +259,7 @@ object Cache {
         print ("end of write test\n");
         return
       }
+      print ("start of write back\n");
       expect (c.io.cmdout.valid,1);
       expect (c.io.cmdout.bits.we,1);
       printf ("cmdout addr:%d\n",peek (c.io.cmdout.bits.addr));
@@ -254,6 +276,11 @@ object Cache {
         expect (c.io.wdataToDRAM.valid,1);
         step (wtime);
       }
+      print ("end of write back\n");
+      print ("start of read for write\n");
+      // data from dram is always 0 in test
+      readRoutine (addr,0);
+      print ("end of read for write\n");
       print ("end of write test\n");
     }
 
@@ -268,6 +295,5 @@ object Cache {
     writeTest (2048,123456789,true);
     readTest  (2048,123456789,false);
     readTest  (1024,234567890,false);
-
   }
 }
