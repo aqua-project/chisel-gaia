@@ -153,6 +153,14 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
           }
         }
 
+
+        // early restart
+        when (wordCnt === UInt (1) && !we) {
+          core_buff.bits := io.rdataToDRAM.bits ## cache (Cat (index,nextWay (index),posInLine) ^ wordCnt (wordsWidth,1)).apply (15,0)
+          core_buff.valid := Bool(true)
+        }
+
+
         // finish
         when (wordCnt === UInt(7)) {
           when (we) {
@@ -167,8 +175,6 @@ class Cache (wayBits : Int,lineBits : Int,wtime : Int) extends Module {
               addr := Cat (tag,index,posInLine) ## UInt (0);
             }
           } .otherwise {
-            core_buff.bits := cache (Cat(index,nextWay (index),posInLine));
-            core_buff.valid := Bool(true)
             state := ready
             nextWay (index) := UInt (1) - nextWay (index);
             lineStateArray (index ## nextWay (index)) := clean;
@@ -229,13 +235,10 @@ object Cache {
       }
       readRoutine (addr,value)
 
-      expect (c.io.rdataFromCore.valid,1)
-      expect (c.io.rdataFromCore.bits,value)
-
       print ("end of read test\n");
     }
 
-    def readRoutine (addr: Int,value: Int) {
+    def readRoutine (addr: Int,value: Int,checkRead: Boolean = true) {
       expect (c.io.cmdout.valid,1);
       expect (c.io.cmdout.bits.we,0);
       expect (c.io.cmdout.bits.addr,addr << 1);
@@ -251,6 +254,10 @@ object Cache {
         poke (c.io.rdataToDRAM.valid,true);
         poke (c.io.rdataToDRAM.bits,value >> 16);
         step (1)
+        if (i == 0 && checkRead) {
+          expect (c.io.rdataFromCore.valid,1)
+          expect (c.io.rdataFromCore.bits,value)
+        }
       }
     }
 
@@ -294,7 +301,7 @@ object Cache {
       }
       print ("start of read for write\n");
       // data from dram is always 0 in test
-      readRoutine (addr,0);
+      readRoutine (addr,0,false);
       print ("end of read for write\n");
       print ("end of write test\n");
     }
