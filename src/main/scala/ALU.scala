@@ -1,5 +1,18 @@
 import Chisel._
 
+class ALUIO extends Bundle {
+  val stall = Bool(INPUT)
+  val optag = UInt(INPUT, width = 5)
+  val a = UInt(INPUT, width = 32)
+  val b = UInt(INPUT, width = 32)
+  val l = UInt(INPUT, width = 8)
+  val r = UInt(OUTPUT, width = 32)
+}
+
+object ALUIO {
+  def apply(): ALUIO = new ALUIO
+}
+
 class ALU extends Module {
 
   val op_add = UInt(0)
@@ -18,14 +31,7 @@ class ALU extends Module {
   val op_cmplt = UInt(26)
   val op_cmple = UInt(27)
 
-  val io = new Bundle {
-    val stall = Bool(INPUT)
-    val optag = UInt(INPUT, width = 5)
-    val a = UInt(INPUT, width = 32)
-    val b = UInt(INPUT, width = 32)
-    val l = UInt(INPUT, width = 8)
-    val r = UInt(OUTPUT, width = 32)
-  }
+  val io = new ALUIO
 
   val x = io.a
   val y = (io.b.toSInt + io.l.toSInt).toUInt

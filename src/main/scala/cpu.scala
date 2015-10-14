@@ -123,6 +123,8 @@ class CPU extends Module {
     val reg_a = io.ic.res.data(22, 18)
     val reg_b = io.ic.res.data(17, 13)
 
+    val mem = d.mem_read || d.mem_write
+
     def dest_match (dest: UInt) =
       MuxCase(Bool(false), Seq(
         Vec(op_alu).contains(op) ->
@@ -132,25 +134,22 @@ class CPU extends Module {
         Vec(op_jr, op_ldh, op_ld, op_ldb).contains(op) ->
           (dest === reg_a)))
 
-    stall := Bool(false)
-
     // load hazard
-    when (d.mem_read && orR(d.reg_dest)) {
-      stall := stall || dest_match(d.reg_dest)
-    }
+    val load_hazard =
+      d.mem_read && orR(d.reg_dest) && dest_match(d.reg_dest)
 
     // data hazard in branch unit
-    when ((d.alu_write || d.misc_write) && orR(d.reg_dest)) {
-      stall := stall || dest_match(d.reg_dest)
-    }
-    when (e.mem_read && orR(e.misc_dest)) {
-      stall := stall || dest_match(e.misc_dest)
-    }
+    val alu_data_hazard =
+      (d.alu_write || d.misc_write) && orR(d.reg_dest) && dest_match(d.reg_dest)
+
+    val mem_data_hazard =
+      e.mem_read && orR(e.misc_dest) && dest_match(e.misc_dest)
 
     // trap hazard
-    when (io.bus.int_go || Vec(op_sysenter, op_sysexit).contains(op)) {
-      stall := stall || (d.mem_read || d.mem_write)
-    }
+    val trap_hazard =
+      (io.bus.int_go || Vec(op_sysenter, op_sysexit).contains(op)) && mem
+
+    stall := load_hazard || alu_data_hazard || mem_data_hazard || trap_hazard
   }
 
   def forward_unit {
